@@ -2599,3 +2599,157 @@ func TestClient_UpdateStatusTransitionAlreadyComplete(t *testing.T) {
 
 	Ok(t, err)
 }
+
+// TestClient_UpdateStatusPipelineCache checks that the statuses of one commit
+// reuse the CI pipeline found for it instead of looking it up each time.
+func TestClient_UpdateStatusPipelineCache(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
+
+	repo := models.Repo{
+		FullName: "runatlantis/atlantis",
+		Owner:    "runatlantis",
+		Name:     "atlantis",
+	}
+	pull := func(sha string) models.PullRequest {
+		return models.PullRequest{
+			Num:        7,
+			BaseRepo:   repo,
+			HeadCommit: sha,
+			HeadBranch: updateStatusHeadBranch,
+		}
+	}
+	mrPipeline := func(sha string) GetCommitResponseLastPipeline {
+		return GetCommitResponseLastPipeline{ID: gitlabPipelineSuccessMrID, SHA: sha, Ref: "refs/merge-requests/7/head", Source: "merge_request_event"}
+	}
+
+	type step struct {
+		sha     string
+		advance time.Duration
+	}
+	cases := []struct {
+		name             string
+		lastPipeline     func(sha string) GetCommitResponseLastPipeline
+		failSetStatus    bool
+		steps            []step
+		expGetCommits    int
+		expSetStatuses   int
+		expPipelineIDSet bool
+	}{
+		{
+			name:             "merge request pipeline is looked up once per commit",
+			lastPipeline:     mrPipeline,
+			steps:            []step{{sha: "sha"}, {sha: "sha"}, {sha: "sha"}},
+			expGetCommits:    1,
+			expSetStatuses:   3,
+			expPipelineIDSet: true,
+		},
+		{
+			name:             "a new commit is looked up again",
+			lastPipeline:     mrPipeline,
+			steps:            []step{{sha: "sha"}, {sha: "sha2"}, {sha: "sha2"}},
+			expGetCommits:    2,
+			expSetStatuses:   3,
+			expPipelineIDSet: true,
+		},
+		{
+			name:             "an expired entry is looked up again",
+			lastPipeline:     mrPipeline,
+			steps:            []step{{sha: "sha"}, {sha: "sha", advance: pipelineCacheTTL}},
+			expGetCommits:    2,
+			expSetStatuses:   2,
+			expPipelineIDSet: true,
+		},
+		{
+			name: "the external pipeline of Atlantis is looked up each time",
+			lastPipeline: func(sha string) GetCommitResponseLastPipeline {
+				return GetCommitResponseLastPipeline{ID: gitlabPipelineSuccessMrID, SHA: sha, Ref: updateStatusHeadBranch, Source: "external"}
+			},
+			steps:            []step{{sha: "sha"}, {sha: "sha"}, {sha: "sha"}},
+			expGetCommits:    3,
+			expSetStatuses:   3,
+			expPipelineIDSet: true,
+		},
+		{
+			name:           "a failed status drops the entry",
+			lastPipeline:   mrPipeline,
+			failSetStatus:  true,
+			steps:          []step{{sha: "sha"}, {sha: "sha"}},
+			expGetCommits:  2,
+			expSetStatuses: 20, // 10 attempts per status
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			getCommits := 0
+			setStatuses := 0
+
+			testServer := httptest.NewServer(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.RequestURI {
+					case "/api/v4/projects/runatlantis%2Fatlantis/repository/commits/sha",
+						"/api/v4/projects/runatlantis%2Fatlantis/repository/commits/sha2":
+						getCommits++
+						sha := r.RequestURI[strings.LastIndex(r.RequestURI, "/")+1:]
+						lastPipeline := c.lastPipeline(sha)
+						getCommitJsonResponse, err := json.Marshal(GetCommitResponse{LastPipeline: &lastPipeline})
+						Ok(t, err)
+						w.WriteHeader(http.StatusOK)
+						_, err = w.Write(getCommitJsonResponse)
+						Ok(t, err)
+
+					case "/api/v4/projects/runatlantis%2Fatlantis/statuses/sha",
+						"/api/v4/projects/runatlantis%2Fatlantis/statuses/sha2":
+						setStatuses++
+						var updateStatusJsonBody UpdateStatusJsonBody
+						err := json.NewDecoder(r.Body).Decode(&updateStatusJsonBody)
+						Ok(t, err)
+						defer r.Body.Close() // nolint: errcheck
+
+						if c.expPipelineIDSet {
+							Equals(t, gitlabPipelineSuccessMrID, updateStatusJsonBody.PipelineId)
+						}
+						if c.failSetStatus {
+							http.Error(w, `{"message":"bad request"}`, http.StatusBadRequest)
+							return
+						}
+						setStatusJsonResponse, err := json.Marshal(EmptyStruct{})
+						Ok(t, err)
+						w.WriteHeader(http.StatusOK)
+						_, err = w.Write(setStatusJsonResponse)
+						Ok(t, err)
+
+					case "/api/v4/":
+						// Rate limiter requests.
+						w.WriteHeader(http.StatusOK)
+
+					default:
+						t.Errorf("got unexpected request at %q", r.RequestURI)
+						http.Error(w, "not found", http.StatusNotFound)
+					}
+				}))
+			defer testServer.Close()
+
+			internalClient, err := gitlab.NewClient("token", gitlab.WithBaseURL(testServer.URL))
+			Ok(t, err)
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			client := &Client{
+				Client:          internalClient,
+				PollingInterval: time.Millisecond,
+				pipelines:       pipelineCache{now: func() time.Time { return now }},
+			}
+
+			for _, s := range c.steps {
+				now = now.Add(s.advance)
+				err := client.UpdateStatus(logger, repo, pull(s.sha), models.PendingCommitStatus, updateStatusSrc, updateStatusDescription, updateStatusTargetUrl)
+				if c.failSetStatus {
+					Assert(t, err != nil, "expected an error")
+				} else {
+					Ok(t, err)
+				}
+			}
+			Equals(t, c.expGetCommits, getCommits)
+			Equals(t, c.expSetStatuses, setStatuses)
+		})
+	}
+}

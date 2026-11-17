@@ -43,6 +43,9 @@ type Client struct {
 	PollingTimeout time.Duration
 	// StatusRetryEnabled enables enhanced retry logic for pipeline status updates.
 	StatusRetryEnabled bool
+	// pipelines remembers the CI pipeline found for a commit, so that the
+	// statuses of one command do not look it up again (see UpdateStatus).
+	pipelines pipelineCache
 }
 
 // legacyMergeRequest captures fields that GitLab still returns in the API but
@@ -653,8 +656,15 @@ func (g *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pu
 	var resp *gitlab.Response
 	var err error
 
+	cacheKey := pipelineCacheKey(repo, pull)
+	cachedPipelineID, cached := g.pipelines.get(cacheKey)
+	if cached {
+		logger.Debug("using pipeline %d found earlier for commit %q", cachedPipelineID, pull.HeadCommit)
+		setCommitStatusOptions.PipelineID = gitlab.Ptr(cachedPipelineID)
+	}
+
 	// Try a couple of times to get the pipeline ID for the commit
-	for {
+	for !cached {
 		attempt := int(pipelineRetryer.Attempt()) + 1
 		commit, resp, err = g.Client.Commits.GetCommit(repo.FullName, pull.HeadCommit, nil)
 		if resp != nil {
@@ -679,6 +689,12 @@ func (g *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pu
 			logger.Info("Pipeline found for commit %s, setting pipeline ID to %d", pull.HeadCommit, commit.LastPipeline.ID)
 			// Set the pipeline ID to the last pipeline that ran for the commit
 			setCommitStatusOptions.PipelineID = gitlab.Ptr(commit.LastPipeline.ID)
+			if commit.LastPipeline.Source != "external" {
+				// A CI pipeline: the next statuses of this commit reuse it. The
+				// external pipeline of Atlantis itself is looked up again each
+				// time, so that a CI pipeline created after it is adopted.
+				g.pipelines.put(cacheKey, commit.LastPipeline.ID)
+			}
 			break
 		}
 		if attempt == pipelineMaxAttempts {
@@ -690,6 +706,11 @@ func (g *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pu
 		sleep := pipelineRetryer.Duration()
 		logger.Info("No pipeline found for commit %s, retrying in %s", pull.HeadCommit, sleep)
 		time.Sleep(sleep)
+	}
+
+	shortID := pull.HeadCommit
+	if commit != nil {
+		shortID = commit.ShortID
 	}
 
 	var (
@@ -706,7 +727,7 @@ func (g *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pu
 			"attempt", attempt,
 			"max_attempts", maxAttempts,
 			"repo", repo.FullName,
-			"commit", commit.ShortID,
+			"commit", shortID,
 			"state", state.String(),
 		)
 
@@ -727,6 +748,8 @@ func (g *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pu
 		}
 
 		if attempt == maxAttempts {
+			// The pipeline may be gone: look it up again next time.
+			g.pipelines.drop(cacheKey)
 			return fmt.Errorf("failed to update commit status for '%s' @ '%s' to '%s' after %d attempts: %w", repo.FullName, pull.HeadCommit, src, attempt, err)
 		}
 
