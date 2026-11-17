@@ -1127,6 +1127,73 @@ func TestClone_MasterHasDiverged(t *testing.T) {
 	assert.FileExists(t, planFile, "Existing plan file should not have been deleted")
 }
 
+// TestMergeAgain_UpdatesSourceRemoteOnlyForForks checks that the divergence
+// check of the merge strategy refreshes the source remote only when the pull
+// request comes from another repository: for a pull request from the same
+// repository the source remote has the URL of origin, and fetching it too would
+// only repeat the same fetch.
+func TestMergeAgain_UpdatesSourceRemoteOnlyForForks(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		fork       bool
+		expUpdated bool
+	}{
+		{name: "same repository", fork: false, expUpdated: false},
+		{name: "fork", fork: true, expUpdated: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			repoDir := initRepo(t)
+			runCmd(t, repoDir, "git", "checkout", "-b", "pr")
+			runCmd(t, repoDir, "touch", "pr-file")
+			runCmd(t, repoDir, "git", "add", "pr-file")
+			runCmd(t, repoDir, "git", "commit", "-m", "pr-file")
+			runCmd(t, repoDir, "git", "checkout", "main")
+			headDir := repoDir
+			if c.fork {
+				headDir = t.TempDir()
+				runCmd(t, headDir, "git", "clone", "--bare", repoDir, ".")
+			}
+
+			// Atlantis checkout of the pull request, merged into main.
+			dataDir := t.TempDir()
+			workspaceDir := filepath.Join(dataDir, "repos", "0", "default")
+			runCmd(t, dataDir, "mkdir", "-p", "repos/0")
+			runCmd(t, dataDir, "git", "clone", "--branch", "main", "--single-branch", repoDir, workspaceDir)
+			runCmd(t, workspaceDir, "git", "remote", "add", "source", headDir)
+			runCmd(t, workspaceDir, "git", "fetch", "source", "+refs/heads/pr")
+			runCmd(t, workspaceDir, "git", "config", "--local", "user.email", "atlantisbot@runatlantis.io")
+			runCmd(t, workspaceDir, "git", "config", "--local", "user.name", "atlantisbot")
+			runCmd(t, workspaceDir, "git", "config", "--local", "commit.gpgsign", "false")
+			runCmd(t, workspaceDir, "git", "merge", "-q", "--no-ff", "-m", "atlantis-merge", "FETCH_HEAD")
+
+			// main moves on, and the head repository gets another branch.
+			runCmd(t, repoDir, "touch", "main-file")
+			runCmd(t, repoDir, "git", "add", "main-file")
+			runCmd(t, repoDir, "git", "commit", "-m", "main-file")
+			mainCommit := strings.TrimSpace(runCmd(t, repoDir, "git", "rev-parse", "main"))
+			runCmd(t, headDir, "git", "branch", "other", "pr")
+
+			wd := &events.FileWorkspace{
+				DataDir:             dataDir,
+				CheckoutMerge:       true,
+				CheckoutDepth:       50,
+				GpgNoSigningEnabled: true,
+			}
+			mergedAgain, err := wd.MergeAgain(logging.NewNoopLogger(t), models.Repo{CloneURL: headDir}, models.PullRequest{
+				BaseRepo:   models.Repo{CloneURL: repoDir},
+				HeadBranch: "pr",
+				BaseBranch: "main",
+			}, "default")
+			Ok(t, err)
+			Assert(t, mergedAgain, "expected a merge again after main moved on")
+			Equals(t, mainCommit, strings.TrimSpace(runCmd(t, workspaceDir, "git", "rev-parse", "refs/remotes/origin/main")))
+
+			refs := runCmd(t, workspaceDir, "git", "for-each-ref", "--format=%(refname)", "refs/remotes/source")
+			Equals(t, c.expUpdated, strings.Contains(refs, "refs/remotes/source/other"))
+		})
+	}
+}
+
 // TestMergeAgain_ConcurrentDiverged verifies that when multiple goroutines call
 // MergeAgain concurrently after the base branch has advanced, only one goroutine
 // acquires the write lock and performs the merge while the rest receive the shared

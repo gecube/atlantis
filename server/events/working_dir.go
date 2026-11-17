@@ -291,10 +291,14 @@ func (w *FileWorkspace) recheckDiverged(logger logging.SimpleLogging, p models.P
 		},
 	}
 	if w.usesPRSourceRemote(headRepo, p) {
-		cmds = append(cmds,
-			[]string{"git", "remote", "set-url", prSourceRemote, headRepo.CloneURL},
-			[]string{"git", "remote", "update"},
-		)
+		cmds = append(cmds, []string{"git", "remote", "set-url", prSourceRemote, headRepo.CloneURL})
+		if headRepo.CloneURL == p.BaseRepo.CloneURL {
+			// A pull request from the same repository: the source remote has the
+			// URL of origin, and updating it too would only repeat the same fetch.
+			cmds = append(cmds, []string{"git", "remote", "update", "origin"})
+		} else {
+			cmds = append(cmds, []string{"git", "remote", "update"})
+		}
 	} else {
 		// On the GitHub App path the source (fork) remote isn't used to fetch the
 		// PR head, so only refresh origin. This avoids fetching a possibly
@@ -313,7 +317,8 @@ func (w *FileWorkspace) recheckDiverged(logger logging.SimpleLogging, p models.P
 		}
 	}
 
-	return w.hasDiverged(logger, cloneDir)
+	// The remote refs were just updated: check the status without another fetch.
+	return w.statusHasDiverged(logger, cloneDir)
 }
 
 func (w *FileWorkspace) HasDiverged(logger logging.SimpleLogging, cloneDir string, projectPath string, autoplanWhenModified []string, pullRequest models.PullRequest) bool {
@@ -400,7 +405,12 @@ func (w *FileWorkspace) hasDiverged(logger logging.SimpleLogging, cloneDir strin
 		return true
 	}
 	logger.Debug("HasDiverged: git fetch completed successfully")
+	return w.statusHasDiverged(logger, cloneDir)
+}
 
+// statusHasDiverged reports whether git status says the checkout and its
+// upstream have diverged, using the remote refs as they are.
+func (w *FileWorkspace) statusHasDiverged(logger logging.SimpleLogging, cloneDir string) bool {
 	logger.Debug("HasDiverged: running git status --untracked-files=no")
 	statusUnoCmd := exec.Command("git", "status", "--untracked-files=no")
 	statusUnoCmd.Dir = cloneDir
